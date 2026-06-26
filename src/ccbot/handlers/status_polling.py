@@ -177,11 +177,11 @@ async def status_poll_loop(bot: Bot) -> None:
             if live_windows:
                 live_ids = {w.window_id for w in live_windows}
             else:
-                # Empty — could be a transient failure.  Re-probe to confirm.
-                tmux_ok = await asyncio.to_thread(
-                    lambda: tmux_manager.get_session() is not None
-                )
-                live_ids = set() if tmux_ok else None
+                # Empty list — could be a transient get_session() failure or
+                # a genuinely empty session.  Re-probe to distinguish.
+                # list_windows() uses a cache so this extra call is cheap.
+                tmux_ok = await asyncio.to_thread(tmux_manager.get_session)
+                live_ids = set() if tmux_ok is not None else None
 
             for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
                 try:

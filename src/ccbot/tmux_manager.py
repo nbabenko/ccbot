@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +24,12 @@ import libtmux
 from .config import SENSITIVE_ENV_VARS, config
 
 logger = logging.getLogger(__name__)
+
+# TTL for the list_windows() cache (seconds).
+# All callers within this window share one libtmux query, eliminating
+# concurrent socket I/O that can corrupt libtmux response parsing and
+# making transient get_session() failures recover on the next cycle.
+_WINDOW_LIST_CACHE_TTL = 0.5
 
 
 @dataclass
@@ -46,6 +53,10 @@ class TmuxManager:
         """
         self.session_name = session_name or config.tmux_session_name
         self._server: libtmux.Server | None = None
+        # list_windows() cache — avoids concurrent libtmux socket I/O
+        self._window_cache: list[TmuxWindow] | None = None
+        self._window_cache_ts: float = 0.0
+        self._window_cache_lock: asyncio.Lock | None = None
 
     @property
     def server(self) -> libtmux.Server:
@@ -95,47 +106,83 @@ class TmuxManager:
     async def list_windows(self) -> list[TmuxWindow]:
         """List all windows in the session with their working directories.
 
+        Results are cached for _WINDOW_LIST_CACHE_TTL seconds so that
+        concurrent callers (status poll, callback handler, session monitor)
+        share a single libtmux query rather than hammering the tmux socket
+        simultaneously, which can corrupt response parsing.
+
         Returns:
             List of TmuxWindow with window info and cwd
         """
+        # Lazy-init the lock (can't create asyncio.Lock in __init__ before loop starts)
+        if self._window_cache_lock is None:
+            self._window_cache_lock = asyncio.Lock()
 
-        def _sync_list_windows() -> list[TmuxWindow]:
-            windows = []
-            session = self.get_session()
+        now = time.monotonic()
+        if self._window_cache is not None and now - self._window_cache_ts < _WINDOW_LIST_CACHE_TTL:
+            return self._window_cache
 
-            if not session:
-                return windows
+        async with self._window_cache_lock:
+            # Re-check after acquiring lock (another coroutine may have just refreshed)
+            now = time.monotonic()
+            if self._window_cache is not None and now - self._window_cache_ts < _WINDOW_LIST_CACHE_TTL:
+                return self._window_cache
 
-            for window in session.windows:
-                name = window.window_name or ""
-                # Skip the main window (placeholder window)
-                if name == config.tmux_main_window_name:
-                    continue
+            result = await asyncio.to_thread(self._sync_list_windows)
+            # Only cache a successful (non-empty or session-confirmed) result.
+            # An empty list from a failed get_session() looks the same as a
+            # genuinely empty session; callers in status_poll_loop already
+            # handle this via re-probe, so caching [] would mask the failure.
+            if result or self.get_session() is not None:
+                self._window_cache = result
+                self._window_cache_ts = time.monotonic()
+            return result
 
-                try:
-                    # Get the active pane's current path and command
-                    pane = window.active_pane
-                    if pane:
-                        cwd = pane.pane_current_path or ""
-                        pane_cmd = pane.pane_current_command or ""
-                    else:
-                        cwd = ""
-                        pane_cmd = ""
+    def _sync_list_windows(self) -> list[TmuxWindow]:
+        """Synchronous list_windows implementation (run via asyncio.to_thread)."""
+        windows = []
+        session = self.get_session()
 
-                    windows.append(
-                        TmuxWindow(
-                            window_id=window.window_id or "",
-                            window_name=name,
-                            cwd=cwd,
-                            pane_current_command=pane_cmd,
-                        )
-                    )
-                except Exception as e:
-                    logger.debug(f"Error getting window info: {e}")
-
+        if not session:
             return windows
 
-        return await asyncio.to_thread(_sync_list_windows)
+        for window in session.windows:
+            name = window.window_name or ""
+            # Skip the main window (placeholder window)
+            if name == config.tmux_main_window_name:
+                continue
+
+            try:
+                # Get the active pane's current path and command
+                pane = window.active_pane
+                if pane:
+                    cwd = pane.pane_current_path or ""
+                    pane_cmd = pane.pane_current_command or ""
+                else:
+                    cwd = ""
+                    pane_cmd = ""
+
+                windows.append(
+                    TmuxWindow(
+                        window_id=window.window_id or "",
+                        window_name=name,
+                        cwd=cwd,
+                        pane_current_command=pane_cmd,
+                    )
+                )
+            except Exception as e:
+                logger.debug(f"Error getting window info: {e}")
+
+        return windows
+
+    def invalidate_window_cache(self) -> None:
+        """Invalidate the list_windows() cache.
+
+        Call after creating or killing a window so the next list_windows()
+        call fetches fresh data rather than returning stale results.
+        """
+        self._window_cache = None
+        self._window_cache_ts = 0.0
 
     async def find_window_by_name(self, window_name: str) -> TmuxWindow | None:
         """Find a window by its name.
@@ -362,7 +409,10 @@ class TmuxManager:
                 logger.error(f"Failed to kill window {window_id}: {e}")
                 return False
 
-        return await asyncio.to_thread(_sync_kill)
+        result = await asyncio.to_thread(_sync_kill)
+        if result:
+            self.invalidate_window_cache()
+        return result
 
     async def create_window(
         self,
@@ -440,7 +490,10 @@ class TmuxManager:
                 logger.error(f"Failed to create window: {e}")
                 return False, f"Failed to create window: {e}", "", ""
 
-        return await asyncio.to_thread(_create_and_start)
+        result = await asyncio.to_thread(_create_and_start)
+        if result[0]:  # success
+            self.invalidate_window_cache()
+        return result
 
 
 # Global instance with default session name
