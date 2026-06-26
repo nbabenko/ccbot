@@ -82,7 +82,7 @@ class Config:
         else:
             self.claude_projects_path = Path.home() / ".claude" / "projects"
 
-        self.monitor_poll_interval = float(os.getenv("MONITOR_POLL_INTERVAL", "2.0"))
+        self.monitor_poll_interval = float(os.getenv("MONITOR_POLL_INTERVAL", "0.5"))
 
         # Display user messages in history and real-time notifications
         # When True, user messages are shown with a 👤 prefix

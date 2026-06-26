@@ -78,6 +78,10 @@ _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 # Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 
+# Last status text enqueued (not yet sent): (user_id, thread_id_or_0) -> text
+# Prevents multiple identical status updates from piling up behind content tasks.
+_queued_status_text: dict[tuple[int, int], str] = {}
+
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
 
@@ -238,6 +242,9 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                             queue.task_done()
                     await _process_content_task(bot, user_id, merged_task)
                 elif task.task_type == "status_update":
+                    # Clear queued-text guard so next unique status can be enqueued
+                    tid = task.thread_id or 0
+                    _queued_status_text.pop((user_id, tid), None)
                     await _process_status_update_task(bot, user_id, task)
                 elif task.task_type == "status_clear":
                     await _do_clear_status_message(bot, user_id, task.thread_id or 0)
@@ -639,16 +646,20 @@ async def enqueue_status_update(
 
     tid = thread_id or 0
 
-    # Deduplicate: skip if text matches what's already displayed
+    skey = (user_id, tid)
+
+    # Deduplicate: skip if text matches what's already displayed or already queued
     if status_text:
-        skey = (user_id, tid)
         info = _status_msg_info.get(skey)
         if info and info[1] == window_id and info[2] == status_text:
+            return
+        if _queued_status_text.get(skey) == status_text:
             return
 
     queue = get_or_create_queue(bot, user_id)
 
     if status_text:
+        _queued_status_text[skey] = status_text
         task = MessageTask(
             task_type="status_update",
             text=status_text,
@@ -665,6 +676,7 @@ def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:
     """Clear status message tracking for a user (and optionally a specific thread)."""
     skey = (user_id, thread_id or 0)
     _status_msg_info.pop(skey, None)
+    _queued_status_text.pop(skey, None)
 
 
 def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> None:
