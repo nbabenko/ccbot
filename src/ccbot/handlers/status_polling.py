@@ -165,11 +165,33 @@ async def status_poll_loop(bot: Bot) -> None:
                             e,
                         )
 
+            # Fetch live windows once per cycle for stale-binding checks.
+            # Previously each find_window_by_id call independently queried
+            # tmux; a transient get_session() failure returns [] which looks
+            # identical to "no windows", causing every bound thread to be
+            # spuriously unbound and saved to state.json.
+            # By fetching once and re-probing when the result is empty we
+            # can distinguish "truly no windows" from "tmux unreachable".
+            live_windows = await tmux_manager.list_windows()
+            live_ids: set[str] | None
+            if live_windows:
+                live_ids = {w.window_id for w in live_windows}
+            else:
+                # Empty — could be a transient failure.  Re-probe to confirm.
+                tmux_ok = await asyncio.to_thread(
+                    lambda: tmux_manager.get_session() is not None
+                )
+                live_ids = set() if tmux_ok else None
+
             for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
                 try:
-                    # Clean up stale bindings (window no longer exists)
-                    w = await tmux_manager.find_window_by_id(wid)
-                    if not w:
+                    if live_ids is None:
+                        # tmux unreachable this cycle — skip stale-binding
+                        # cleanup but still attempt status update (it handles
+                        # unavailability gracefully via its own find_window_by_id).
+                        pass
+                    elif wid not in live_ids:
+                        # Window definitively gone — clean up stale binding.
                         session_manager.unbind_thread(user_id, thread_id)
                         await clear_topic_state(user_id, thread_id, bot)
                         logger.info(
