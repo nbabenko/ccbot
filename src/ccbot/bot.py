@@ -298,8 +298,11 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # Send Escape control character (no enter)
-    await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
-    await safe_reply(update.message, "⎋ Sent Escape")
+    ok = await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
+    if ok:
+        await safe_reply(update.message, "⎋ Sent Escape")
+    else:
+        await safe_reply(update.message, "❌ Failed to send Escape — tmux error")
 
 
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1119,7 +1122,7 @@ async def _create_and_bind_window(
                     logger.warning("Failed to forward pending text: %s", send_msg)
                     await safe_send(
                         context.bot,
-                        resolved_chat,
+                        session_manager.resolve_chat_id(user.id, pending_thread_id),
                         f"❌ Failed to send pending message: {send_msg}",
                         message_thread_id=pending_thread_id,
                     )
@@ -1497,7 +1500,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 logger.warning("Failed to forward pending text: %s", send_msg)
                 await safe_send(
                     context.bot,
-                    resolved_chat,
+                    session_manager.resolve_chat_id(user.id, thread_id),
                     f"❌ Failed to send pending message: {send_msg}",
                     message_thread_id=thread_id,
                 )
@@ -1592,8 +1595,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not w:
             await query.answer("⚠️ Window not found — try refreshing", show_alert=True)
         else:
-            await tmux_manager.send_keys(w.window_id, tmux_key, enter=False, literal=False)
-            if prefix == CB_ASK_ESC:
+            ok = await tmux_manager.send_keys(w.window_id, tmux_key, enter=False, literal=False)
+            if not ok:
+                await query.answer("⚠️ Failed to send key — window may be busy", show_alert=True)
+            elif prefix == CB_ASK_ESC:
                 await clear_interactive_msg(user.id, context.bot, thread_id)
                 await query.answer(label)
             else:
@@ -1629,9 +1634,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Window not found", show_alert=True)
             return
 
-        await tmux_manager.send_keys(
+        ok = await tmux_manager.send_keys(
             w.window_id, tmux_key, enter=enter, literal=literal
         )
+        if not ok:
+            await query.answer("⚠️ Failed to send key", show_alert=True)
+            return
         await query.answer(_KEY_LABELS.get(key_id, key_id))
 
         # Refresh screenshot after key press
@@ -1650,6 +1658,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 )
             except Exception:
                 pass  # Screenshot unchanged or message too old
+
+    else:
+        logger.warning("callback_handler: unknown callback data %r", data)
+        await query.answer()
 
 
 # --- Streaming response / notifications ---
